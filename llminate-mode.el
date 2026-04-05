@@ -18,6 +18,16 @@
 (require 'llminate-session)
 
 ;; Optional — loaded only if available
+
+;; Declare flymake functions used in --collect-diagnostics.
+;; The actual calls are guarded by (fboundp 'flymake-diagnostics).
+(declare-function flymake-diagnostics "flymake" (&optional beg end))
+(declare-function flymake-diagnostic-beg "flymake" (diagnostic))
+(declare-function flymake-diagnostic-type "flymake" (diagnostic))
+(declare-function flymake-diagnostic-text "flymake" (diagnostic))
+
+;; Declare server function used when starting with claude-code backend.
+(declare-function server-running-p "server" (&optional name))
 (require 'llminate-completion nil t)
 
 ;;;; Customization
@@ -32,19 +42,27 @@
 (defvar llminate-mode--modeline-string " llm[off]"
   "Current modeline indicator string.")
 
+(defun llminate-mode--backend-prefix ()
+  "Return the modeline prefix for the active backend.
+\"llm\" for the llminate backend, \"cc\" for Claude Code."
+  (if (eq (bound-and-true-p llminate-bridge-backend) 'claude-code)
+      "cc"
+    "llm"))
+
 (defun llminate-mode--update-modeline ()
-  "Update the modeline string based on bridge state."
-  (let ((state (llminate-bridge-state)))
+  "Update the modeline string based on bridge state and active backend."
+  (let ((state (llminate-bridge-state))
+        (prefix (llminate-mode--backend-prefix)))
     (setq llminate-mode--modeline-string
           (cond
-           ((eq state 'stopped)           " llm[off]")
-           ((eq state 'starting)          " llm[start]")
-           ((eq state 'idle)              " llm[idle]")
-           ((eq state 'streaming)         " llm[streaming]")
-           ((eq state 'tool-executing)    " llm[tool]")
-           ((eq state 'awaiting-approval) " llm[awaiting]")
-           ((eq state 'emacs-eval)        " llm[emacs]")
-           (t                             " llm[?]")))
+           ((eq state 'stopped)           (format " %s[off]" prefix))
+           ((eq state 'starting)          (format " %s[start]" prefix))
+           ((eq state 'idle)              (format " %s[idle]" prefix))
+           ((eq state 'streaming)         (format " %s[streaming]" prefix))
+           ((eq state 'tool-executing)    (format " %s[tool]" prefix))
+           ((eq state 'awaiting-approval) (format " %s[awaiting]" prefix))
+           ((eq state 'emacs-eval)        (format " %s[emacs]" prefix))
+           (t                             (format " %s[?]" prefix))))
     (force-mode-line-update t)))
 
 ;; Hook into bridge events to keep the modeline current
@@ -62,21 +80,23 @@
 
 (defun llminate-mode--on-tool-use (name _input)
   "Modeline update for ToolUse — show tool name."
-  (setq llminate-mode--modeline-string
-        (format " llm[tool:%s]"
-                (if (> (length name) 12)
-                    (substring name 0 12)
-                  name)))
-  (force-mode-line-update t))
+  (let ((prefix (llminate-mode--backend-prefix)))
+    (setq llminate-mode--modeline-string
+          (format " %s[tool:%s]" prefix
+                  (if (> (length name) 12)
+                      (substring name 0 12)
+                    name)))
+    (force-mode-line-update t)))
 
 (defun llminate-mode--on-emacs-eval (command _args _rid)
   "Modeline update for EmacsEval — show command name."
-  (setq llminate-mode--modeline-string
-        (format " llm[emacs:%s]"
-                (if (> (length command) 12)
-                    (substring command 0 12)
-                  command)))
-  (force-mode-line-update t))
+  (let ((prefix (llminate-mode--backend-prefix)))
+    (setq llminate-mode--modeline-string
+          (format " %s[emacs:%s]" prefix
+                  (if (> (length command) 12)
+                      (substring command 0 12)
+                    command)))
+    (force-mode-line-update t)))
 
 (defun llminate-mode--on-end (_reason)
   "Modeline update for End."
@@ -190,6 +210,7 @@
                      ("Fix region"            . llminate-fix-region)
                      ("Send diagnostics"      . llminate-send-diagnostics)
                      ("Emacs commands list"   . llminate-emacs-commands-list)
+                     ("Switch AI backend"     . llminate-bridge-switch-backend)
                      ("Switch render backend" . llminate-chat-set-render-backend)
                      ("Re-render all responses" . llminate-chat-rerender-all)
                      ("Start completion server" . llminate-completion-start-server)
@@ -214,6 +235,7 @@
     (define-key prefix (kbd ".") #'completion-at-point)
     (define-key prefix (kbd "w") #'llminate-emacs-commands-list)
     (define-key prefix (kbd "m") #'llminate-chat-set-render-backend)
+    (define-key prefix (kbd "b") #'llminate-bridge-switch-backend)
     (define-key map (kbd "C-c q") prefix)
     map)
   "Keymap for `llminate-mode'.  All bindings under C-c q.")
@@ -236,9 +258,11 @@ Keybindings (C-c q prefix):
   C-c q .  Trigger completion-at-point
   C-c q w  List allowed Emacs commands
   C-c q m  Switch markdown render backend
+  C-c q b  Switch AI backend (llminate / Claude Code)
 
-Modeline indicator shows bridge state:
-  llm[idle]  llm[streaming]  llm[tool:Bash]  llm[emacs:magit]  llm[awaiting]"
+Modeline indicator shows backend and bridge state:
+  llm[idle]  llm[streaming]  llm[tool:Bash]  (llminate backend)
+  cc[idle]   cc[streaming]   cc[tool:Bash]   (Claude Code backend)"
   :global t
   :lighter llminate-mode--modeline-string
   :keymap llminate-mode-map
@@ -250,6 +274,15 @@ Modeline indicator shows bridge state:
         ;; Add CAPF in prog-mode buffers if llminate-completion is loaded
         (when (fboundp 'llminate-completion--setup)
           (add-hook 'prog-mode-hook #'llminate-completion--setup))
+        ;; Ensure Emacs server is running when using Claude Code backend.
+        ;; Claude Code calls Emacs commands via emacsclient -e, which
+        ;; requires the server to be active.
+        (when (and (eq (bound-and-true-p llminate-bridge-backend) 'claude-code)
+                   (not (bound-and-true-p server-process)))
+          (require 'server)
+          (unless (server-running-p)
+            (server-start)
+            (message "[llminate] Started Emacs server for emacsclient access")))
         (message "[llminate] Mode enabled — C-c q c for command palette"))
     (llminate-mode--unregister-modeline-hooks)
     (when (fboundp 'llminate-completion--setup)
@@ -258,7 +291,8 @@ Modeline indicator shows bridge state:
       (llminate-bridge-stop))
     (when (llminate-layout-active-p)
       (llminate-layout-toggle))
-    (setq llminate-mode--modeline-string " llm[off]")
+    (setq llminate-mode--modeline-string
+          (format " %s[off]" (llminate-mode--backend-prefix)))
     (force-mode-line-update t)
     (message "[llminate] Mode disabled")))
 

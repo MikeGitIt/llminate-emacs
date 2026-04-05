@@ -694,8 +694,9 @@ timestamp + separator, and cleans up markers."
     ;; Mark that the assistant turn is NOT yet started — it will be
     ;; created lazily when the first assistant message chunk arrives.
     (setq llminate-chat--assistant-turn-started nil)
-    ;; Send to the bridge
-    (llminate-bridge-send-prompt prompt #'llminate-chat--response-handler)))
+    ;; Send to the bridge — use context-enriched variant so the AI
+    ;; knows about the Emacs environment and available EmacsCommands
+    (llminate-bridge-send-prompt-with-context prompt #'llminate-chat--response-handler)))
 
 (defun llminate-chat--ensure-assistant-turn ()
   "Start the assistant turn if it hasn't been started yet for this response."

@@ -21,6 +21,18 @@
 (require 'json)
 (require 'cl-lib)
 (require 'llminate-emacs-commands)
+(require 'llminate-bridge-claude)
+
+;; Declare flymake functions used in --collect-diagnostics.
+;; The actual calls are guarded by (fboundp 'flymake-diagnostics).
+(declare-function flymake-diagnostics "flymake" (&optional beg end))
+(declare-function flymake-diagnostic-beg "flymake" (diagnostic))
+(declare-function flymake-diagnostic-type "flymake" (diagnostic))
+(declare-function flymake-diagnostic-text "flymake" (diagnostic))
+
+;; Declare server function used when switching to claude-code backend.
+;; Guarded by (require 'server) at runtime.
+(declare-function server-running-p "server" (&optional name))
 
 ;;;; Customization
 
@@ -29,8 +41,21 @@
   :group 'llminate
   :prefix "llminate-bridge-")
 
+(defcustom llminate-bridge-backend 'llminate
+  "Which AI backend to use.
+`llminate'    — the llminate Rust binary (long-lived subprocess)
+`claude-code' — the Claude Code CLI via `claude -p' (per-turn processes)"
+  :type '(choice (const :tag "llminate (Rust binary)" llminate)
+                 (const :tag "Claude Code CLI" claude-code))
+  :group 'llminate-bridge)
+
 (defcustom llminate-bridge-executable "llminate"
   "Path to the llminate executable."
+  :type 'string
+  :group 'llminate-bridge)
+
+(defcustom llminate-bridge-claude-executable "claude"
+  "Path to the Claude Code CLI executable."
   :type 'string
   :group 'llminate-bridge)
 
@@ -146,20 +171,31 @@ Called with (TYPE DATA) where TYPE is `message', `end', or `error'.")
     args))
 
 (defun llminate-bridge-start (&optional project-dir)
-  "Start the llminate subprocess.
-Optional PROJECT-DIR sets the working directory."
+  "Start the AI backend subprocess.
+Dispatches to the llminate or Claude Code backend based on
+`llminate-bridge-backend'.  Optional PROJECT-DIR sets the working directory."
   (interactive
    (list (read-directory-name "Project directory: " default-directory)))
+  (let ((dir (or project-dir
+                 llminate-bridge--project-dir
+                 (when (fboundp 'project-root)
+                   (when-let* ((proj (project-current)))
+                     (project-root proj)))
+                 default-directory)))
+    (pcase llminate-bridge-backend
+      ('claude-code
+       (when (llminate-bridge-running-p)
+         (user-error "Claude Code backend is already running; use `llminate-bridge-stop' first"))
+       (llminate-bridge-claude--start dir))
+      (_
+       (llminate-bridge--start-llminate dir)))))
+
+(defun llminate-bridge--start-llminate (dir)
+  "Start the llminate Rust binary as a long-lived subprocess in DIR."
   (when (and llminate-bridge--process
              (process-live-p llminate-bridge--process))
     (user-error "llminate is already running; use `llminate-bridge-stop' first"))
-  (let* ((dir (or project-dir
-                  llminate-bridge--project-dir
-                  (when (fboundp 'project-root)
-                    (when-let* ((proj (project-current)))
-                      (project-root proj)))
-                  default-directory))
-         (default-directory (expand-file-name dir))
+  (let* ((default-directory (expand-file-name dir))
          (args (llminate-bridge--build-args)))
     (setq llminate-bridge--project-dir default-directory)
     (setq llminate-bridge--line-buffer "")
@@ -180,8 +216,16 @@ Optional PROJECT-DIR sets the working directory."
     (message "[llminate] Started (dir: %s)" default-directory)))
 
 (defun llminate-bridge-stop ()
-  "Stop the llminate subprocess."
+  "Stop the AI backend."
   (interactive)
+  (pcase llminate-bridge-backend
+    ('claude-code
+     (llminate-bridge-claude--stop))
+    (_
+     (llminate-bridge--stop-llminate))))
+
+(defun llminate-bridge--stop-llminate ()
+  "Stop the llminate Rust binary subprocess."
   ;; Set state BEFORE killing — the sentinel fires synchronously on delete-process
   ;; and must see 'stopped to avoid auto-restart.
   (setq llminate-bridge--state 'stopped)
@@ -201,15 +245,18 @@ Optional PROJECT-DIR sets the working directory."
   (llminate-bridge-start llminate-bridge--project-dir))
 
 (defun llminate-bridge-ensure-running ()
-  "Start llminate if it is not already running."
-  (unless (and llminate-bridge--process
-               (process-live-p llminate-bridge--process))
+  "Start the backend if it is not already running."
+  (unless (llminate-bridge-running-p)
     (llminate-bridge-start)))
 
 (defun llminate-bridge-running-p ()
-  "Return non-nil if the llminate subprocess is alive."
-  (and llminate-bridge--process
-       (process-live-p llminate-bridge--process)))
+  "Return non-nil if the AI backend is active."
+  (pcase llminate-bridge-backend
+    ('claude-code
+     (llminate-bridge-claude--running-p))
+    (_
+     (and llminate-bridge--process
+          (process-live-p llminate-bridge--process)))))
 
 ;;;; Process sentinel (crash handling)
 
@@ -442,11 +489,11 @@ APPROVED is t or nil."
          :approved (if approved t :json-false))))
 
 (defun llminate-bridge-send-prompt (prompt &optional callback)
-  "Send PROMPT to llminate as a user message.
+  "Send PROMPT to the AI backend as a user message.
 Optional CALLBACK is called with (TYPE DATA) for each event in
 the response: `message', `tool-use', `tool-result', `end', `error'.
 
-If llminate is not idle, the prompt is queued."
+If the backend is not idle, the prompt is queued."
   (llminate-bridge-ensure-running)
   (if (eq llminate-bridge--state 'idle)
       (llminate-bridge--send-prompt-internal prompt callback)
@@ -454,7 +501,15 @@ If llminate is not idle, the prompt is queued."
     (push (cons prompt callback) llminate-bridge--prompt-queue)))
 
 (defun llminate-bridge--send-prompt-internal (prompt callback)
-  "Internal: immediately send PROMPT and register CALLBACK."
+  "Internal: dispatch PROMPT + CALLBACK to the active backend."
+  (pcase llminate-bridge-backend
+    ('claude-code
+     (llminate-bridge-claude--send-prompt prompt callback))
+    (_
+     (llminate-bridge--send-prompt-llminate prompt callback))))
+
+(defun llminate-bridge--send-prompt-llminate (prompt callback)
+  "Send PROMPT to the llminate Rust binary via stdin.  Register CALLBACK."
   (setq llminate-bridge--response-callback callback)
   (setq llminate-bridge--accumulated-text "")
   (setq llminate-bridge--state 'streaming)
@@ -476,6 +531,39 @@ If llminate is not idle, the prompt is queued."
 (defun llminate-bridge-model ()
   "Return the model name reported by llminate, or nil."
   llminate-bridge--model-name)
+
+;;;; Backend switching
+
+(defun llminate-bridge-switch-backend (backend)
+  "Switch the AI backend to BACKEND.
+Stops the current backend if running, switches, and restarts.
+BACKEND is a symbol: `llminate' or `claude-code'."
+  (interactive
+   (let* ((other (if (eq llminate-bridge-backend 'claude-code) "llminate" "claude-code"))
+          (current (symbol-name llminate-bridge-backend))
+          (choice (completing-read
+                   (format "Switch backend (current: %s): " current)
+                   '("llminate" "claude-code") nil t nil nil other)))
+     (list (intern choice))))
+  (cl-block llminate-bridge-switch-backend
+    (when (eq backend llminate-bridge-backend)
+      (message "[llminate] Already using %s backend" backend)
+      (cl-return-from llminate-bridge-switch-backend))
+    (let ((was-running (llminate-bridge-running-p))
+          (dir llminate-bridge--project-dir))
+      (when was-running
+        (llminate-bridge-stop)
+        (sit-for 0.3))
+      (setq llminate-bridge-backend backend)
+      ;; Ensure Emacs server is running for the Claude Code backend
+      (when (eq backend 'claude-code)
+        (require 'server)
+        (unless (server-running-p)
+          (server-start)
+          (message "[llminate] Started Emacs server for emacsclient access")))
+      (when was-running
+        (llminate-bridge-start dir))
+      (message "[llminate] Switched to %s backend" backend))))
 
 ;;;; Phase 5: Deep Editor Context Integration
 
@@ -595,14 +683,82 @@ buffer navigation, and window management instead of shelling out when possible."
             (mapconcat #'identity (append cmds nil) ", ")
             ctx-json)))
 
+(defun llminate-bridge--emacsclient-instructions ()
+  "Build instructions telling the AI how to use emacsclient for Emacs commands.
+Used when the Claude Code backend is active, since it cannot use EmacsCommand
+directly.  The AI calls Emacs via its Bash tool + emacsclient -e."
+  (let ((cmds (when (boundp 'llminate-emacs-commands--registry)
+                (mapcar #'car llminate-emacs-commands--registry))))
+    (format "\
+# Emacs Integration (via emacsclient)
+
+You are running inside an Emacs editor session.  The user has `server-start' \
+active, so you can execute Emacs functions from your Bash tool using:
+
+  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"COMMAND\" ARGS...)'
+
+This routes through a security whitelist.  The return value is a JSON string:
+  {\"success\": true, \"result\": ...}   on success
+  {\"success\": false, \"error\": \"...\"}  on failure or denial
+
+**Available whitelisted commands:**
+
+File/buffer: find-file, find-file-other-window, switch-to-buffer, save-buffer, \
+revert-buffer, buffer-string, buffer-file-name, buffer-list, goto-line, goto-char
+
+Git (magit): magit-status, magit-stage-file, magit-unstage-file, magit-commit*, \
+magit-push*, magit-pull, magit-log-current, magit-diff-buffer-file, \
+magit-get-current-branch, magit-git-string, magit-stash*
+
+LSP (eglot): eglot-rename*, eglot-code-actions, eglot-find-declaration, \
+eglot-find-implementation, xref-find-definitions, xref-find-references, \
+flymake-diagnostics, eglot-format-buffer*
+
+Compilation: compile*, recompile, next-error, previous-error
+
+Project: project-root, project-files, project-find-file
+
+Window: split-window-right, split-window-below, delete-window, \
+delete-other-windows, balance-windows
+
+Queries: point, line-number-at-pos, current-column, buffer-modified-p, \
+default-directory, mark, region-beginning, region-end
+
+(Commands marked * require user approval before executing.)
+
+**When to use emacsclient vs file tools:**
+- Use emacsclient when the user wants to *interact* with their editor \
+(open a file in a buffer, trigger magit, run compile, navigate with eglot)
+- Use Read/Write/Edit when you need to read or modify file *contents* programmatically
+- Use Bash for shell commands that don't have Emacs equivalents
+
+**Examples:**
+  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"find-file\" \"/path/to/file.rs\")'
+  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"magit-status\")'
+  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"goto-line\" 42)'
+  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"xref-find-definitions\" \"my_function\")'
+  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"recompile\")'
+
+All registered commands: %s"
+            (mapconcat #'identity cmds ", "))))
+
 (defun llminate-bridge-send-prompt-with-context (prompt &optional callback)
-  "Send PROMPT to llminate with editor context prepended.
+  "Send PROMPT to the backend with editor context prepended.
+For the llminate backend, prepends editor state JSON.
+For the Claude Code backend, also includes emacsclient instructions
+so the AI knows how to call Emacs functions via Bash.
 Optional CALLBACK is forwarded to `llminate-bridge-send-prompt'."
   (let* ((ctx (llminate-bridge--collect-editor-context))
          (json-encoding-pretty-print nil)
          (ctx-str (json-encode ctx))
-         (enriched (format "[Editor Context]\n%s\n\n[User Prompt]\n%s"
-                           ctx-str prompt)))
+         (emacsclient-section
+          (when (eq llminate-bridge-backend 'claude-code)
+            (llminate-bridge--emacsclient-instructions)))
+         (enriched (if emacsclient-section
+                       (format "%s\n\n[Editor Context]\n%s\n\n[User Prompt]\n%s"
+                               emacsclient-section ctx-str prompt)
+                     (format "[Editor Context]\n%s\n\n[User Prompt]\n%s"
+                             ctx-str prompt))))
     (llminate-bridge-send-prompt enriched callback)))
 
 (provide 'llminate-bridge)

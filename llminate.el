@@ -31,6 +31,7 @@
 ;;; Code:
 
 (require 'llminate-bridge)
+(require 'llminate-bridge-claude)
 (require 'llminate-chat)
 (require 'llminate-layout)
 (require 'llminate-approval)

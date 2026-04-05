@@ -219,7 +219,8 @@ LEVEL is one of the symbols: `allow', `prompt', `deny'."
 (defun llminate-emacs-commands-execute (command args request-id send-result-fn)
   "Execute COMMAND with ARGS according to its security level.
 REQUEST-ID is used to correlate the response.
-SEND-RESULT-FN is called with (REQUEST-ID SUCCESS RESULT) to send the result back.
+SEND-RESULT-FN is called with (REQUEST-ID SUCCESS RESULT)
+to send the result back.
 
 Returns immediately for `allow' commands.
 For `prompt' commands, shows an approval dialog first.
@@ -240,13 +241,31 @@ For `deny' or unregistered commands, sends an error result."
       (llminate-emacs-commands--prompt-approval
        command args request-id send-result-fn)))))
 
+(defun llminate-emacs-commands--user-window ()
+  "Return the most appropriate window for user-facing commands.
+Prefers a window that is NOT showing an llminate buffer (chat, prompt,
+activity).  Falls back to the selected window if none found."
+  (or (cl-find-if
+       (lambda (w)
+         (let ((name (buffer-name (window-buffer w))))
+           (not (or (string-prefix-p "*llminate " name)
+                    (string-prefix-p " *llminate" name)))))
+       (window-list nil 'no-minibuffer))
+      (selected-window)))
+
 (defun llminate-emacs-commands--do-execute (command args request-id send-result-fn)
-  "Actually execute COMMAND with ARGS and send result via SEND-RESULT-FN."
+  "Actually execute COMMAND with ARGS and send result via SEND-RESULT-FN.
+Interactive commands (find-file, magit-status, etc.) execute in the
+user's code window, not the llminate chat panel."
   (condition-case err
       (let* ((fn (intern command))
-             (raw-result (if args
-                             (apply fn args)
-                           (funcall fn)))
+             ;; Execute in the user's code window so commands like
+             ;; find-file open there instead of in the chat panel.
+             (raw-result (with-selected-window
+                             (llminate-emacs-commands--user-window)
+                           (if args
+                               (apply fn args)
+                             (funcall fn))))
              (result (llminate-emacs-commands--serialize-result raw-result)))
         (funcall send-result-fn request-id t result))
     (error
@@ -277,6 +296,72 @@ Keybindings in the prompt:
        (t
         (funcall send-result-fn request-id nil
                  (format "User denied execution of '%s'" command)))))))
+
+;;;; CLI dispatch — entry point for emacsclient -e
+;;
+;; When the Claude Code backend is active, there is no bidirectional stdio
+;; pipe.  Instead, Claude Code calls Emacs commands via its Bash tool:
+;;
+;;   emacsclient -e '(llminate-emacs-commands-cli-dispatch "find-file" "/path")'
+;;
+;; This function routes through the same whitelist and security checks as
+;; the internal EmacsEval path, executes in the user's code window, and
+;; returns a JSON string that Claude reads from the Bash output.
+
+(require 'json)
+
+(defun llminate-emacs-commands-cli-dispatch (command &rest args)
+  "Execute COMMAND with ARGS via emacsclient, returning a JSON result string.
+Checks the whitelist, prompts the user for `prompt'-level commands,
+and executes in the user's code window.
+
+Usage from a shell (requires `server-start' in Emacs):
+
+  emacsclient -e \\='(llminate-emacs-commands-cli-dispatch \"find-file\" \"/path\")\\='
+  emacsclient -e \\='(llminate-emacs-commands-cli-dispatch \"magit-status\")\\='
+  emacsclient -e \\='(llminate-emacs-commands-cli-dispatch \"goto-line\" 42)\\='"
+  (let ((level (llminate-emacs-commands-get-level command)))
+    (cond
+     ;; Not registered or denied
+     ((or (null level) (eq level 'deny))
+      (json-encode `((success . :json-false)
+                     (error . ,(format "Command '%s' is not allowed" command)))))
+     ;; Allow — execute immediately
+     ((eq level 'allow)
+      (llminate-emacs-commands--cli-execute command args))
+     ;; Prompt — ask the user synchronously (blocks emacsclient until answered)
+     ((eq level 'prompt)
+      (let ((response (read-char-exclusive
+                       (format "[llminate] Execute `%s'%s? (y)es (n)o (a)lways: "
+                               command
+                               (if args (format " with args %S" args) "")))))
+        (cond
+         ((eq response ?y)
+          (llminate-emacs-commands--cli-execute command args))
+         ((eq response ?a)
+          (llminate-emacs-commands-upgrade-to-allow command)
+          (message "[llminate] '%s' upgraded to always-allow" command)
+          (llminate-emacs-commands--cli-execute command args))
+         (t
+          (json-encode `((success . :json-false)
+                         (error . ,(format "User denied execution of '%s'"
+                                           command)))))))))))
+
+(defun llminate-emacs-commands--cli-execute (command args)
+  "Execute COMMAND with ARGS in the user's code window.
+Returns a JSON string with `success' and `result' or `error' fields."
+  (condition-case err
+      (let* ((fn (intern command))
+             (raw-result (with-selected-window
+                             (llminate-emacs-commands--user-window)
+                           (if args
+                               (apply fn args)
+                             (funcall fn))))
+             (result (llminate-emacs-commands--serialize-result raw-result)))
+        (json-encode `((success . t) (result . ,result))))
+    (error
+     (json-encode `((success . :json-false)
+                    (error . ,(error-message-string err)))))))
 
 (provide 'llminate-emacs-commands)
 
