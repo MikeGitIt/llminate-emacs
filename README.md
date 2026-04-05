@@ -1,6 +1,6 @@
 # llminate-emacs
 
-Emacs integration for the [llminate](https://github.com/mickillah/llminate) AI coding assistant, with support for Claude Code CLI as an alternative backend.
+Emacs integration for the [llminate](https://github.com/MikeGitIt/llminate) AI coding assistant, with support for Claude Code CLI as an alternative backend.
 
 ## Features
 
