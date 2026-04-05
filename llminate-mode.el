@@ -16,6 +16,7 @@
 (require 'llminate-chat)
 (require 'llminate-layout)
 (require 'llminate-session)
+(require 'llminate-emacs-commands)
 
 ;; Optional — loaded only if available
 
@@ -28,6 +29,17 @@
 
 ;; Declare server function used when starting with claude-code backend.
 (declare-function server-running-p "server" (&optional name))
+
+;; Declare treesit functions used in smart selection.
+;; Guarded at runtime by (treesit-available-p) / (treesit-parser-list).
+(declare-function treesit-available-p "treesit" ())
+(declare-function treesit-parser-list "treesit" (&optional buffer))
+(declare-function treesit-node-at "treesit" (pos &optional parser-or-lang named))
+(declare-function treesit-node-parent "treesit" (node))
+(declare-function treesit-node-start "treesit" (node))
+(declare-function treesit-node-end "treesit" (node))
+(declare-function treesit-node-type "treesit" (node))
+
 (require 'llminate-completion nil t)
 
 ;;;; Customization
@@ -182,6 +194,81 @@
           (insert prompt))
         (llminate-chat-send)))))
 
+;;;; Smart selection — structural code unit at point
+
+(defun llminate--treesit-available-p ()
+  "Return non-nil if the current buffer has an active tree-sitter parser."
+  (and (fboundp 'treesit-available-p)
+       (treesit-available-p)
+       (fboundp 'treesit-parser-list)
+       (treesit-parser-list)))
+
+(defun llminate--smart-select-region ()
+  "Return (BEG . END) for the enclosing code unit at point.
+Uses tree-sitter when available to find a structurally meaningful
+node (function, class, block, statement).  Falls back to
+`beginning-of-defun' / `end-of-defun'.
+If a region is already active, returns the current region bounds."
+  (cond
+   ;; User already selected something — respect it
+   ((use-region-p)
+    (cons (region-beginning) (region-end)))
+   ;; Tree-sitter path
+   ((llminate--treesit-available-p)
+    (llminate--treesit-enclosing-unit))
+   ;; Fallback — select enclosing defun
+   (t
+    (save-excursion
+      (let ((end (progn (end-of-defun) (point)))
+            (beg (progn (beginning-of-defun) (point))))
+        (cons beg end))))))
+
+(defun llminate--treesit-enclosing-unit ()
+  "Walk up the tree-sitter AST from point to find an enclosing code unit.
+Returns (BEG . END).  Selects the smallest named node that spans
+at least 2 lines, skipping trivial single-token nodes."
+  (let* ((node (treesit-node-at (point)))
+         (candidate nil))
+    ;; Walk up parents until we find a multi-line node
+    (while (and node (not candidate))
+      (let ((beg (treesit-node-start node))
+            (end (treesit-node-end node)))
+        (when (and beg end
+                   (> (count-lines beg end) 1)
+                   ;; Skip the root node (entire buffer)
+                   (treesit-node-parent node))
+          (setq candidate (cons beg end))))
+      (setq node (treesit-node-parent node)))
+    ;; If nothing multi-line found, fall back to defun
+    (or candidate
+        (save-excursion
+          (let ((end (progn (end-of-defun) (point)))
+                (beg (progn (beginning-of-defun) (point))))
+            (cons beg end))))))
+
+(defun llminate-smart-explain ()
+  "Select the enclosing code unit at point and explain it.
+Uses tree-sitter for structural selection when available,
+otherwise falls back to the enclosing defun.
+If a region is already active, explains the selected region."
+  (interactive)
+  (let ((bounds (llminate--smart-select-region)))
+    (when bounds
+      ;; Briefly highlight the selection so the user sees what was picked
+      (pulse-momentary-highlight-region (car bounds) (cdr bounds))
+      (llminate-explain-region (car bounds) (cdr bounds)))))
+
+(defun llminate-smart-fix ()
+  "Select the enclosing code unit at point and send it for fixing.
+Uses tree-sitter for structural selection when available,
+otherwise falls back to the enclosing defun.
+If a region is already active, fixes the selected region."
+  (interactive)
+  (let ((bounds (llminate--smart-select-region)))
+    (when bounds
+      (pulse-momentary-highlight-region (car bounds) (cdr bounds))
+      (llminate-fix-region (car bounds) (cdr bounds)))))
+
 (defun llminate-mode--collect-diagnostics ()
   "Collect flymake diagnostics for the current buffer as a list of strings."
   (when (and (fboundp 'flymake-diagnostics)
@@ -207,7 +294,9 @@
                      ("List sessions"         . llminate-session-list)
                      ("Save session"          . llminate-session-save)
                      ("Explain region"        . llminate-explain-region)
+                     ("Smart explain"         . llminate-smart-explain)
                      ("Fix region"            . llminate-fix-region)
+                     ("Smart fix"             . llminate-smart-fix)
                      ("Send diagnostics"      . llminate-send-diagnostics)
                      ("Emacs commands list"   . llminate-emacs-commands-list)
                      ("Switch AI backend"     . llminate-bridge-switch-backend)
@@ -230,7 +319,9 @@
     (define-key prefix (kbd "r") #'llminate-session-resume)
     (define-key prefix (kbd "c") #'llminate-command-palette)
     (define-key prefix (kbd "e") #'llminate-explain-region)
+    (define-key prefix (kbd "E") #'llminate-smart-explain)
     (define-key prefix (kbd "f") #'llminate-fix-region)
+    (define-key prefix (kbd "F") #'llminate-smart-fix)
     (define-key prefix (kbd "d") #'llminate-send-diagnostics)
     (define-key prefix (kbd ".") #'completion-at-point)
     (define-key prefix (kbd "w") #'llminate-emacs-commands-list)
@@ -253,7 +344,9 @@ Keybindings (C-c q prefix):
   C-c q r  Resume session
   C-c q c  Command palette
   C-c q e  Explain region
+  C-c q E  Smart explain (auto-select enclosing code unit)
   C-c q f  Fix / improve region
+  C-c q F  Smart fix (auto-select enclosing code unit)
   C-c q d  Send diagnostics to llminate
   C-c q .  Trigger completion-at-point
   C-c q w  List allowed Emacs commands

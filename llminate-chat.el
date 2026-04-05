@@ -349,6 +349,8 @@ Read-only display of the conversation with streaming support.
     (define-key map (kbd "C-c C-k") #'llminate-chat-cancel)
     (define-key map (kbd "M-p")     #'llminate-chat-prompt-history-prev)
     (define-key map (kbd "M-n")     #'llminate-chat-prompt-history-next)
+    (define-key map (kbd "<up>")    #'llminate-chat-prompt-up)
+    (define-key map (kbd "<down>")  #'llminate-chat-prompt-down)
     map)
   "Keymap for `llminate-chat-prompt-mode'.")
 
@@ -359,8 +361,8 @@ Multi-line input area.
 Keybindings:
   C-c C-c  -- Send the current prompt
   C-c C-k  -- Cancel / clear the prompt
-  M-p      -- Previous prompt from history
-  M-n      -- Next prompt from history
+  Up/M-p   -- Previous prompt from history (Up at first line)
+  Down/M-n -- Next prompt from history (Down at last line)
   RET      -- Insert newline (multi-line input)
 
 \\{llminate-chat-prompt-mode-map}"
@@ -821,7 +823,24 @@ Each entry has :role, :content, :timestamp."
 
 (add-hook 'llminate-bridge-session-resume-hook #'llminate-chat--on-session-resume)
 
-;;;; Prompt history navigation
+;;;; Prompt history navigation — arrow keys + M-p/M-n
+
+(defun llminate-chat-prompt-up ()
+  "In the prompt buffer: navigate history when at the first line.
+Otherwise move the cursor up normally.  This mirrors shell/REPL
+behavior — arrow keys cycle history at buffer boundaries."
+  (interactive)
+  (if (= (line-number-at-pos) 1)
+      (llminate-chat-prompt-history-prev)
+    (forward-line -1)))
+
+(defun llminate-chat-prompt-down ()
+  "In the prompt buffer: navigate history when at the last line.
+Otherwise move the cursor down normally."
+  (interactive)
+  (if (= (line-number-at-pos) (line-number-at-pos (point-max)))
+      (llminate-chat-prompt-history-next)
+    (forward-line 1)))
 
 (defun llminate-chat--history-push (prompt)
   "Add PROMPT to the history, respecting `llminate-chat-max-history'."

@@ -686,28 +686,83 @@ buffer navigation, and window management instead of shelling out when possible."
 (defun llminate-bridge--emacsclient-instructions ()
   "Build instructions telling the AI how to use emacsclient for Emacs commands.
 Used when the Claude Code backend is active, since it cannot use EmacsCommand
-directly.  The AI calls Emacs via its Bash tool + emacsclient -e."
-  (let ((cmds (when (boundp 'llminate-emacs-commands--registry)
-                (mapcar #'car llminate-emacs-commands--registry))))
+directly.  The AI calls Emacs via its Bash tool + emacsclient -e.
+Resolves the full emacsclient path and server socket at build time
+so the subprocess does not depend on PATH or socket discovery."
+  (let* ((cmds (when (boundp 'llminate-emacs-commands--registry)
+                 (mapcar #'car llminate-emacs-commands--registry)))
+         ;; Resolve full emacsclient path
+         (ec-path (or (executable-find "emacsclient") "emacsclient"))
+         ;; Resolve server name for -s flag
+         (sock-name (or (bound-and-true-p server-name) "server"))
+         ;; Build the base command with resolved paths
+         (ec-cmd (format "%s -s %s -e" ec-path sock-name)))
     (format "\
-# Emacs Integration (via emacsclient)
+# IMPORTANT: Emacs IDE Integration
 
-You are running inside an Emacs editor session.  The user has `server-start' \
-active, so you can execute Emacs functions from your Bash tool using:
+You are operating as an assistant inside the user's Emacs IDE.  The user \
+sees your actions reflected in their editor.  You MUST prefer using Emacs \
+commands via emacsclient for any operation that has an Emacs equivalent, \
+so the user sees the result in their editor.
 
-  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"COMMAND\" ARGS...)'
+## How to call Emacs commands
 
-This routes through a security whitelist.  The return value is a JSON string:
+Use your Bash tool with the EXACT command prefix below (path and socket \
+are pre-resolved):
+
+  %s '(llminate-emacs-commands-cli-dispatch \"COMMAND\" ARGS...)'
+
+Return value is JSON:
   {\"success\": true, \"result\": ...}   on success
-  {\"success\": false, \"error\": \"...\"}  on failure or denial
+  {\"success\": false, \"error\": \"...\"}  on denial or failure
 
-**Available whitelisted commands:**
+If a command is denied or fails, fall back to your standard tools \
+(Bash, Read, Write, etc.).  Do NOT skip emacsclient preemptively.
 
-File/buffer: find-file, find-file-other-window, switch-to-buffer, save-buffer, \
-revert-buffer, buffer-string, buffer-file-name, buffer-list, goto-line, goto-char
+## When to use emacsclient (PREFERRED)
 
-Git (magit): magit-status, magit-stage-file, magit-unstage-file, magit-commit*, \
-magit-push*, magit-pull, magit-log-current, magit-diff-buffer-file, \
+ALWAYS prefer emacsclient for these — your standard tools are the FALLBACK:
+
+- **Opening/navigating files**: Use `find-file` so the file opens in the \
+user's editor, not just read silently.  Fall back to Read only for \
+programmatic inspection where the user doesn't need to see the buffer.
+- **Git operations**: Use magit commands so results appear in the user's \
+magit interface.  For file-specific commands (magit-diff-buffer-file, \
+magit-stage-file), first call find-file to open the file, then call \
+the magit command with NO arguments (it operates on the current buffer). \
+Fall back to raw git commands only if the magit equivalent fails.
+- **Code navigation**: Use xref-find-definitions, xref-find-references, \
+eglot-find-declaration, eglot-find-implementation to jump the user's \
+cursor to the right location.
+- **Diagnostics**: Use flymake-diagnostics to get errors from the user's \
+live session (includes unsaved changes and LSP analysis).
+- **Compilation**: Use compile or recompile to trigger builds in the \
+user's compilation buffer.  Fall back to Bash only if denied.
+- **Queries about editor state**: Use point, line-number-at-pos, \
+buffer-modified-p, default-directory, buffer-file-name, buffer-list, \
+project-root to understand what the user is looking at right now.
+- **Window management**: Use split-window-right, split-window-below, \
+delete-other-windows, balance-windows when arranging the user's layout.
+
+## When to use your standard tools directly
+
+- **Read/Write/Edit**: For programmatic file modifications (the user \
+asked you to edit code, not just view it)
+- **Grep/Glob**: For searching across many files
+- **Bash**: For shell commands with no Emacs equivalent, or as fallback \
+when an emacsclient command is denied
+
+## Whitelisted commands
+
+File/buffer: find-file, find-file-other-window, switch-to-buffer, \
+save-buffer, revert-buffer, buffer-string, buffer-file-name, \
+buffer-list, goto-line, goto-char
+
+Git (magit): magit-status, magit-stage-file, magit-unstage-file, \
+magit-commit*, magit-push*, magit-pull, magit-log-current, \
+magit-diff-buffer-file (diff for current file), \
+magit-diff-unstaged (all unstaged changes), \
+magit-diff-staged (all staged changes), \
 magit-get-current-branch, magit-git-string, magit-stash*
 
 LSP (eglot): eglot-rename*, eglot-code-actions, eglot-find-declaration, \
@@ -724,22 +779,22 @@ delete-other-windows, balance-windows
 Queries: point, line-number-at-pos, current-column, buffer-modified-p, \
 default-directory, mark, region-beginning, region-end
 
-(Commands marked * require user approval before executing.)
+(* = requires user approval before executing)
 
-**When to use emacsclient vs file tools:**
-- Use emacsclient when the user wants to *interact* with their editor \
-(open a file in a buffer, trigger magit, run compile, navigate with eglot)
-- Use Read/Write/Edit when you need to read or modify file *contents* programmatically
-- Use Bash for shell commands that don't have Emacs equivalents
+## Examples
 
-**Examples:**
-  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"find-file\" \"/path/to/file.rs\")'
-  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"magit-status\")'
-  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"goto-line\" 42)'
-  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"xref-find-definitions\" \"my_function\")'
-  emacsclient -e '(llminate-emacs-commands-cli-dispatch \"recompile\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"find-file\" \"/path/to/file.rs\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"magit-status\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"goto-line\" 42)'
+  %s '(llminate-emacs-commands-cli-dispatch \"magit-get-current-branch\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"xref-find-definitions\" \"my_function\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"recompile\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"flymake-diagnostics\")'
+  %s '(llminate-emacs-commands-cli-dispatch \"project-root\")'
 
-All registered commands: %s"
+Full command list: %s"
+            ec-cmd
+            ec-cmd ec-cmd ec-cmd ec-cmd ec-cmd ec-cmd ec-cmd ec-cmd
             (mapconcat #'identity cmds ", "))))
 
 (defun llminate-bridge-send-prompt-with-context (prompt &optional callback)

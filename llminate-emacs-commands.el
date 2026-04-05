@@ -59,6 +59,8 @@
     ("magit-pull"                . allow)
     ("magit-log-current"         . allow)
     ("magit-diff-buffer-file"    . allow)
+    ("magit-diff-unstaged"       . allow)
+    ("magit-diff-staged"         . allow)
     ("magit-get-current-branch"  . allow)
     ("magit-git-string"          . allow)
     ("magit-stash"               . prompt)
@@ -243,29 +245,44 @@ For `deny' or unregistered commands, sends an error result."
 
 (defun llminate-emacs-commands--user-window ()
   "Return the most appropriate window for user-facing commands.
-Prefers a window that is NOT showing an llminate buffer (chat, prompt,
-activity).  Falls back to the selected window if none found."
+Prefers a window showing a file-visiting buffer or a regular code
+buffer.  Skips llminate buffers, treemacs, special buffers, and
+sidebars.  Falls back to the selected window if none qualifies."
   (or (cl-find-if
        (lambda (w)
-         (let ((name (buffer-name (window-buffer w))))
-           (not (or (string-prefix-p "*llminate " name)
-                    (string-prefix-p " *llminate" name)))))
+         (let* ((buf (window-buffer w))
+                (name (buffer-name buf)))
+           (and
+            ;; Skip llminate buffers
+            (not (string-prefix-p "*llminate " name))
+            (not (string-prefix-p " *llminate" name))
+            ;; Skip treemacs
+            (not (string-prefix-p " *Treemacs" name))
+            (not (string-prefix-p "*Treemacs" name))
+            ;; Skip special/internal buffers (but allow *scratch*)
+            (or (buffer-file-name buf)
+                (not (string-prefix-p "*" name))
+                (string= name "*scratch*"))
+            ;; Skip dedicated side windows (treemacs, help, etc.)
+            (not (window-dedicated-p w)))))
        (window-list nil 'no-minibuffer))
       (selected-window)))
 
 (defun llminate-emacs-commands--do-execute (command args request-id send-result-fn)
   "Actually execute COMMAND with ARGS and send result via SEND-RESULT-FN.
 Interactive commands (find-file, magit-status, etc.) execute in the
-user's code window, not the llminate chat panel."
+user's code window, not the llminate chat panel.
+When ARGS is nil and the function is interactive, uses
+`call-interactively' so the command's interactive spec provides
+defaults (e.g. current file for magit-diff-buffer-file)."
   (condition-case err
       (let* ((fn (intern command))
-             ;; Execute in the user's code window so commands like
-             ;; find-file open there instead of in the chat panel.
              (raw-result (with-selected-window
                              (llminate-emacs-commands--user-window)
-                           (if args
-                               (apply fn args)
-                             (funcall fn))))
+                           (cond
+                            (args (apply fn args))
+                            ((commandp fn) (call-interactively fn))
+                            (t (funcall fn)))))
              (result (llminate-emacs-commands--serialize-result raw-result)))
         (funcall send-result-fn request-id t result))
     (error
@@ -349,15 +366,31 @@ Usage from a shell (requires `server-start' in Emacs):
 
 (defun llminate-emacs-commands--cli-execute (command args)
   "Execute COMMAND with ARGS in the user's code window.
-Returns a JSON string with `success' and `result' or `error' fields."
+When ARGS is nil and the function is interactive, uses
+`call-interactively' so the command's interactive spec provides
+defaults.  If applying with ARGS fails (wrong-number-of-arguments),
+retries without args.  Raises the Emacs frame after execution so
+display commands (magit-diff, find-file, etc.) are visible when
+called from an external process.
+Returns a JSON string with `success'/`result' or `error'."
   (condition-case err
       (let* ((fn (intern command))
              (raw-result (with-selected-window
                              (llminate-emacs-commands--user-window)
-                           (if args
-                               (apply fn args)
-                             (funcall fn))))
+                           (cond
+                            (args
+                             (condition-case _
+                                 (apply fn args)
+                               (wrong-number-of-arguments
+                                (if (commandp fn)
+                                    (call-interactively fn)
+                                  (funcall fn)))))
+                            ((commandp fn) (call-interactively fn))
+                            (t (funcall fn)))))
              (result (llminate-emacs-commands--serialize-result raw-result)))
+        ;; Raise the Emacs frame so visual commands are seen when
+        ;; called via emacsclient from an external process.
+        (select-frame-set-input-focus (selected-frame))
         (json-encode `((success . t) (result . ,result))))
     (error
      (json-encode `((success . :json-false)

@@ -76,7 +76,11 @@ Each entry is a plist with :type (\"text\" or \"tool_use\"),
   "Build the argument list for a Claude Code subprocess.
 The prompt is not included — it is piped via stdin."
   (let ((args (list "-p"
-                    "--output-format" "stream-json")))
+                    "--output-format" "stream-json"
+                    "--verbose")))
+    ;; Pre-approve emacsclient so Claude Code's permission system
+    ;; doesn't block Emacs IDE integration commands
+    (setq args (append args (list "--allowedTools" "Bash(*emacsclient*)")))
     ;; Resume previous session if we have one
     (when llminate-bridge-claude--session-id
       (setq args (append args (list "--resume" llminate-bridge-claude--session-id))))
@@ -218,11 +222,40 @@ If a process is still running, queue the prompt."
           (llminate-bridge-claude--handle-content-block-stop event))
          ((string= event-type "result")
           (llminate-bridge-claude--handle-result event))
-         ;; Ignore other event types (message_start, message_delta, etc.)
-         ))
+         ;; Claude Code may wrap streaming events in a stream_event envelope
+         ((string= event-type "stream_event")
+          (llminate-bridge-claude--unwrap-stream-event event))
+         ;; Log unhandled types for debugging
+         (t
+          (when llminate-bridge-debug-process-output
+            (message "[claude-code] Unhandled event type: %s" event-type)))))
     ((json-parse-error error)
      (message "[claude-code] JSON parse error: %s (line: %.80s)"
               (error-message-string err) line))))
+
+;;;; Stream event unwrapping
+
+(defun llminate-bridge-claude--unwrap-stream-event (event)
+  "Unwrap a `stream_event' EVENT envelope and dispatch the inner event.
+Claude Code may wrap content_block_* events inside:
+  {\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",...}}"
+  (let* ((inner (plist-get event :event))
+         (inner-type (when inner (plist-get inner :type))))
+    (when inner-type
+      (cond
+       ((string= inner-type "content_block_start")
+        (llminate-bridge-claude--handle-content-block-start inner))
+       ((string= inner-type "content_block_delta")
+        (llminate-bridge-claude--handle-content-block-delta inner))
+       ((string= inner-type "content_block_stop")
+        (llminate-bridge-claude--handle-content-block-stop inner))
+       ((string= inner-type "message_start") nil)
+       ((string= inner-type "message_delta") nil)
+       ((string= inner-type "message_stop") nil)
+       (t
+        (when llminate-bridge-debug-process-output
+          (message "[claude-code] Unhandled stream_event inner type: %s"
+                   inner-type)))))))
 
 ;;;; Event handlers
 
@@ -243,12 +276,45 @@ Extracts session-id and model from init subtype."
 
 (defun llminate-bridge-claude--handle-assistant (event)
   "Handle an `assistant' EVENT.
-This appears at the start of a turn with the message metadata.
-We use it to note the turn has begun but don't emit hooks yet —
-content arrives via content_block_* events."
-  ;; The assistant event contains the full message structure but we
-  ;; process content incrementally via content_block events.
-  (ignore event))
+In print mode (`-p'), Claude Code returns the full response here
+rather than streaming via content_block_* events.  Extract
+message.content blocks and fire the appropriate hooks."
+  (let* ((message (plist-get event :message))
+         (content (when message (plist-get message :content))))
+    (when (listp content)
+      (dolist (block content)
+        (let ((block-type (plist-get block :type)))
+          (cond
+           ((string= block-type "text")
+            (let ((text (plist-get block :text)))
+              (when (and text (not (string-empty-p text)))
+                ;; Accumulate
+                (setq llminate-bridge--accumulated-text
+                      (concat llminate-bridge--accumulated-text text))
+                (setq llminate-bridge--state 'streaming)
+                ;; Fire message hook and callback
+                (run-hook-with-args 'llminate-bridge-message-hook
+                                    "assistant" text)
+                (when llminate-bridge--response-callback
+                  (funcall llminate-bridge--response-callback
+                           'message text)))))
+           ((string= block-type "tool_use")
+            (let ((name (plist-get block :name))
+                  (id (plist-get block :id))
+                  (input (plist-get block :input)))
+              (setq llminate-bridge--state 'tool-executing)
+              ;; Fire tool-use hook
+              (run-hook-with-args 'llminate-bridge-tool-use-hook name input)
+              (when llminate-bridge--response-callback
+                (funcall llminate-bridge--response-callback
+                         'tool-use (list :name name :id id :input input)))
+              ;; Synthetic tool-result (Claude Code executes internally)
+              (run-hook-with-args 'llminate-bridge-tool-result-hook
+                                  "(tool executed by Claude Code)")
+              (when llminate-bridge--response-callback
+                (funcall llminate-bridge--response-callback
+                         'tool-result "(tool executed by Claude Code)"))))
+           (t nil)))))))
 
 (defun llminate-bridge-claude--handle-content-block-start (event)
   "Handle a `content_block_start' EVENT.

@@ -478,6 +478,94 @@ The modeline indicator shows the active backend and current state:
 | `llminate-completion.el`      | Copilot-style ghost text inline completion      |
 | `llminate-pkg.el`             | Package metadata                                |
 
+## Prompt history
+
+The `*llminate Prompt*` buffer supports history navigation:
+
+| Key        | Action                                              |
+|------------|-----------------------------------------------------|
+| `Up`       | Previous prompt (when cursor is on the first line)  |
+| `Down`     | Next prompt (when cursor is on the last line)       |
+| `M-p`      | Previous prompt (from anywhere)                     |
+| `M-n`      | Next prompt (from anywhere)                         |
+| `C-c C-c`  | Send the prompt                                     |
+| `C-c C-k`  | Clear the prompt                                    |
+
+History is kept in memory for the current session (up to `llminate-chat-max-history` entries, default 100).
+
+## Smart selection
+
+Place your cursor inside any code and use these to auto-select the enclosing code unit (function, struct, block, etc.) and send it to the AI:
+
+| Key       | Command                  | Description                         |
+|-----------|--------------------------|-------------------------------------|
+| `C-c q E` | `llminate-smart-explain` | Select enclosing code + explain     |
+| `C-c q F` | `llminate-smart-fix`     | Select enclosing code + fix/improve |
+
+Selection uses tree-sitter when available (Emacs 29.1+), falling back to `beginning-of-defun`/`end-of-defun`. If a region is already active, it uses the existing selection. The selected region is briefly highlighted with `pulse` before sending.
+
+The lowercase variants (`C-c q e`, `C-c q f`) still require a manually selected region.
+
+## Troubleshooting
+
+### Claude Code: "Emacs commands are being denied"
+
+**Cause:** Claude Code's own permission system blocks `emacsclient` calls from its Bash tool. In `--print` mode (`-p`), it cannot prompt for approval interactively, so it silently denies unrecognized commands.
+
+**Fix:** This is handled automatically -- `llminate-bridge-claude.el` passes `--allowedTools "Bash(*emacsclient*)"` when spawning the Claude Code process. If you still see denials:
+
+1. Verify the bridge file is loaded: `M-: (featurep 'llminate-bridge-claude)`
+2. Restart the bridge: `M-x llminate-bridge-restart`
+3. Check that `llminate-bridge-claude--build-args` includes the `--allowedTools` flag: `M-: (llminate-bridge-claude--build-args)`
+
+### Claude Code: no response in chat buffer
+
+**Cause:** Claude Code with `-p --output-format stream-json` requires `--verbose`, and the response arrives in a single `assistant` event (not incremental `content_block_delta` events).
+
+**Fix:** Both are handled automatically. If you see no output:
+
+1. Enable debug output: `(setq llminate-bridge-debug-process-output t)`
+2. Send a prompt, then check ` *claude-code-process*` (note the leading space) for raw NDJSON
+3. Check `*Messages*` for JSON parse errors or unhandled event types
+
+### emacsclient: "can't find socket" or connection refused
+
+**Cause:** The Emacs server isn't running, or `emacsclient` can't find the socket.
+
+**Fix:**
+
+1. Verify the server is running: `M-x server-running-p` (should return `t`)
+2. If not, start it: `M-x server-start`
+3. `llminate-mode` auto-starts the server when the Claude Code backend is active, but if you enabled the mode before switching backends, restart it: `M-x llminate-mode` twice (off then on)
+
+### emacsclient works from terminal but not from Claude Code
+
+**Cause:** Claude Code's Bash tool runs in a sandboxed environment. The `--allowedTools` flag (see above) must whitelist `emacsclient`. Additionally, interactive commands that open buffers (e.g., `magit-diff-buffer-file`) require the Emacs frame to be raised so the display is visible.
+
+**Verify from terminal:**
+
+```bash
+emacsclient -s server -e '(llminate-emacs-commands-cli-dispatch "buffer-name")' 2>&1; echo "EXIT: $?"
+```
+
+Should return `{"success":true,"result":"..."}` with exit code 0.
+
+### Commands execute but nothing appears in Emacs
+
+**Cause:** When `emacsclient -e` is called from an external process, Emacs may not raise its frame, so visual commands (magit-diff, find-file) execute but their buffers aren't visible.
+
+**Fix:** The dispatch layer calls `select-frame-set-input-focus` after execution to raise the Emacs frame. If buffers still don't appear, check that `llminate-emacs-commands--user-window` is selecting the right window (it skips treemacs, llminate panels, and dedicated side windows).
+
+### Wrong buffer targeted by Emacs commands
+
+**Cause:** The `--user-window` function picks the most appropriate code window, skipping treemacs, llminate buffers, and dedicated side windows. If the wrong window is selected, file-specific commands (like `magit-diff-buffer-file`) may target the wrong buffer.
+
+**Fix:** For file-specific magit commands, the AI should first call `find-file` to open the target file, then call the magit command with no arguments (it operates on the current buffer). The instructions injected into Claude Code prompts explain this pattern.
+
+### Byte-compilation warnings
+
+If you byte-compile the package and see warnings about undefined functions (`flymake-diagnostics`, `server-running-p`, `treesit-*`), these are expected -- the functions are declared with `declare-function` and are guarded at runtime by availability checks.
+
 ## Debugging
 
 Enable raw process output logging:
@@ -490,6 +578,11 @@ Then inspect the process buffer:
 - `*llminate-process*` for the llminate backend
 - ` *claude-code-process*` for the Claude Code backend (note leading space)
 
+Check `*Messages*` for:
+- `[llminate]` or `[claude-code]` prefixed messages from the bridge
+- Unhandled event types (when debug is enabled)
+- JSON parse errors from malformed stream data
+
 ## License
 
-See the [llminate](https://github.com/mickillah/llminate) project for license details.
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
