@@ -21,7 +21,6 @@
 (require 'json)
 (require 'cl-lib)
 (require 'llminate-emacs-commands)
-(require 'llminate-bridge-claude)
 
 ;; Declare flymake functions used in --collect-diagnostics.
 ;; The actual calls are guarded by (fboundp 'flymake-diagnostics).
@@ -29,10 +28,6 @@
 (declare-function flymake-diagnostic-beg "flymake" (diagnostic))
 (declare-function flymake-diagnostic-type "flymake" (diagnostic))
 (declare-function flymake-diagnostic-text "flymake" (diagnostic))
-
-;; Declare server function used when switching to claude-code backend.
-;; Guarded by (require 'server) at runtime.
-(declare-function server-running-p "server" (&optional name))
 
 ;;;; Customization
 
@@ -43,10 +38,9 @@
 
 (defcustom llminate-bridge-backend 'llminate
   "Which AI backend to use.
-`llminate'    — the llminate Rust binary (long-lived subprocess)
-`claude-code' — the Claude Code CLI via `claude -p' (per-turn processes)"
-  :type '(choice (const :tag "llminate (Rust binary)" llminate)
-                 (const :tag "Claude Code CLI" claude-code))
+Available choices are determined by registered backends.
+Use `llminate-bridge-switch-backend' to change interactively."
+  :type 'symbol
   :group 'llminate-bridge)
 
 (defcustom llminate-bridge-executable "llminate"
@@ -155,6 +149,67 @@ Called with (TYPE DATA) where TYPE is `message', `end', or `error'.")
 (defvar llminate-bridge--project-dir nil
   "The project directory for the current llminate session.")
 
+;;;; Backend registry
+
+(defvar llminate-bridge--backend-registry nil
+  "Alist of registered backends.
+Each entry is (NAME . PLIST) where PLIST has keys:
+  :name           - Symbol, unique key
+  :label          - String, for UI display
+  :prefix         - String, 2-3 char modeline indicator
+  :start-fn       - Function (DIR), start the backend
+  :stop-fn        - Function (), stop the backend
+  :running-p-fn   - Function () -> bool, check if running
+  :send-prompt-fn - Function (PROMPT CALLBACK), send a prompt
+  :enrich-fn      - Function () -> string (optional), context enrichment
+  :setup-fn       - Function () (optional), called on backend switch
+  :teardown-fn    - Function () (optional), called before switching away")
+
+(defun llminate-bridge-register-backend (plist)
+  "Register a backend described by PLIST.
+Required keys: :name, :label, :prefix, :start-fn, :stop-fn,
+:running-p-fn, :send-prompt-fn.
+Optional keys: :enrich-fn, :setup-fn, :teardown-fn, :resume-fn."
+  (let ((name (plist-get plist :name)))
+    (unless name (error "Backend registration requires :name"))
+    (unless (plist-get plist :label) (error "Backend '%s' requires :label" name))
+    (unless (plist-get plist :prefix) (error "Backend '%s' requires :prefix" name))
+    (unless (plist-get plist :start-fn) (error "Backend '%s' requires :start-fn" name))
+    (unless (plist-get plist :stop-fn) (error "Backend '%s' requires :stop-fn" name))
+    (unless (plist-get plist :running-p-fn) (error "Backend '%s' requires :running-p-fn" name))
+    (unless (plist-get plist :send-prompt-fn) (error "Backend '%s' requires :send-prompt-fn" name))
+    ;; Remove existing entry if any
+    (setq llminate-bridge--backend-registry
+          (assq-delete-all name llminate-bridge--backend-registry))
+    ;; Add new entry
+    (push (cons name plist) llminate-bridge--backend-registry)
+    ;; Update defcustom choices
+    (llminate-bridge--update-backend-choices)
+    name))
+
+(defun llminate-bridge-unregister-backend (name)
+  "Remove the backend named NAME from the registry."
+  (setq llminate-bridge--backend-registry
+        (assq-delete-all name llminate-bridge--backend-registry))
+  (llminate-bridge--update-backend-choices))
+
+(defun llminate-bridge--get-backend (&optional name)
+  "Return the backend plist for NAME (default: current backend).
+Signals an error if the backend is not registered."
+  (let* ((key (or name llminate-bridge-backend))
+         (entry (assq key llminate-bridge--backend-registry)))
+    (unless entry (error "Backend '%s' not registered" key))
+    (cdr entry)))
+
+(defun llminate-bridge--update-backend-choices ()
+  "Update the `custom-type' of `llminate-bridge-backend' to reflect registered backends."
+  (when llminate-bridge--backend-registry
+    (put 'llminate-bridge-backend 'custom-type
+         `(choice ,@(mapcar (lambda (e)
+                              `(const :tag ,(plist-get (cdr e) :label)
+                                      ,(car e)))
+                            llminate-bridge--backend-registry)))))
+
 ;;;; Process management
 
 (defun llminate-bridge--build-args ()
@@ -172,23 +227,21 @@ Called with (TYPE DATA) where TYPE is `message', `end', or `error'.")
 
 (defun llminate-bridge-start (&optional project-dir)
   "Start the AI backend subprocess.
-Dispatches to the llminate or Claude Code backend based on
-`llminate-bridge-backend'.  Optional PROJECT-DIR sets the working directory."
+Dispatches to the registered backend based on `llminate-bridge-backend'.
+Optional PROJECT-DIR sets the working directory."
   (interactive
    (list (read-directory-name "Project directory: " default-directory)))
-  (let ((dir (or project-dir
-                 llminate-bridge--project-dir
-                 (when (fboundp 'project-root)
-                   (when-let* ((proj (project-current)))
-                     (project-root proj)))
-                 default-directory)))
-    (pcase llminate-bridge-backend
-      ('claude-code
-       (when (llminate-bridge-running-p)
-         (user-error "Claude Code backend is already running; use `llminate-bridge-stop' first"))
-       (llminate-bridge-claude--start dir))
-      (_
-       (llminate-bridge--start-llminate dir)))))
+  (let* ((dir (or project-dir
+                  llminate-bridge--project-dir
+                  (when (fboundp 'project-root)
+                    (when-let* ((proj (project-current)))
+                      (project-root proj)))
+                  default-directory))
+         (desc (llminate-bridge--get-backend)))
+    (when (llminate-bridge-running-p)
+      (user-error "%s is already running; use `llminate-bridge-stop' first"
+                  (plist-get desc :label)))
+    (funcall (plist-get desc :start-fn) dir)))
 
 (defun llminate-bridge--start-llminate (dir)
   "Start the llminate Rust binary as a long-lived subprocess in DIR."
@@ -218,11 +271,8 @@ Dispatches to the llminate or Claude Code backend based on
 (defun llminate-bridge-stop ()
   "Stop the AI backend."
   (interactive)
-  (pcase llminate-bridge-backend
-    ('claude-code
-     (llminate-bridge-claude--stop))
-    (_
-     (llminate-bridge--stop-llminate))))
+  (let ((desc (llminate-bridge--get-backend)))
+    (funcall (plist-get desc :stop-fn))))
 
 (defun llminate-bridge--stop-llminate ()
   "Stop the llminate Rust binary subprocess."
@@ -249,14 +299,16 @@ Dispatches to the llminate or Claude Code backend based on
   (unless (llminate-bridge-running-p)
     (llminate-bridge-start)))
 
+(defun llminate-bridge--llminate-running-p ()
+  "Return non-nil if the llminate Rust binary subprocess is alive."
+  (and llminate-bridge--process
+       (process-live-p llminate-bridge--process)))
+
 (defun llminate-bridge-running-p ()
   "Return non-nil if the AI backend is active."
-  (pcase llminate-bridge-backend
-    ('claude-code
-     (llminate-bridge-claude--running-p))
-    (_
-     (and llminate-bridge--process
-          (process-live-p llminate-bridge--process)))))
+  (let ((entry (assq llminate-bridge-backend llminate-bridge--backend-registry)))
+    (when entry
+      (funcall (plist-get (cdr entry) :running-p-fn)))))
 
 ;;;; Process sentinel (crash handling)
 
@@ -502,11 +554,8 @@ If the backend is not idle, the prompt is queued."
 
 (defun llminate-bridge--send-prompt-internal (prompt callback)
   "Internal: dispatch PROMPT + CALLBACK to the active backend."
-  (pcase llminate-bridge-backend
-    ('claude-code
-     (llminate-bridge-claude--send-prompt prompt callback))
-    (_
-     (llminate-bridge--send-prompt-llminate prompt callback))))
+  (let ((desc (llminate-bridge--get-backend)))
+    (funcall (plist-get desc :send-prompt-fn) prompt callback)))
 
 (defun llminate-bridge--send-prompt-llminate (prompt callback)
   "Send PROMPT to the llminate Rust binary via stdin.  Register CALLBACK."
@@ -537,30 +586,37 @@ If the backend is not idle, the prompt is queued."
 (defun llminate-bridge-switch-backend (backend)
   "Switch the AI backend to BACKEND.
 Stops the current backend if running, switches, and restarts.
-BACKEND is a symbol: `llminate' or `claude-code'."
+BACKEND is a symbol matching a registered backend name."
   (interactive
-   (let* ((other (if (eq llminate-bridge-backend 'claude-code) "llminate" "claude-code"))
-          (current (symbol-name llminate-bridge-backend))
+   (let* ((candidates (mapcar (lambda (e)
+                                (cons (plist-get (cdr e) :label) (car e)))
+                              llminate-bridge--backend-registry))
+          (current-label (let ((entry (assq llminate-bridge-backend
+                                            llminate-bridge--backend-registry)))
+                           (if entry (plist-get (cdr entry) :label)
+                             (symbol-name llminate-bridge-backend))))
           (choice (completing-read
-                   (format "Switch backend (current: %s): " current)
-                   '("llminate" "claude-code") nil t nil nil other)))
-     (list (intern choice))))
+                   (format "Switch backend (current: %s): " current-label)
+                   (mapcar #'car candidates) nil t)))
+     (list (cdr (assoc choice candidates)))))
   (cl-block llminate-bridge-switch-backend
     (when (eq backend llminate-bridge-backend)
       (message "[llminate] Already using %s backend" backend)
       (cl-return-from llminate-bridge-switch-backend))
     (let ((was-running (llminate-bridge-running-p))
-          (dir llminate-bridge--project-dir))
+          (dir llminate-bridge--project-dir)
+          ;; Call teardown on old backend if present
+          (old-desc (ignore-errors (llminate-bridge--get-backend))))
+      (when (and old-desc (plist-get old-desc :teardown-fn))
+        (funcall (plist-get old-desc :teardown-fn)))
       (when was-running
         (llminate-bridge-stop)
         (sit-for 0.3))
       (setq llminate-bridge-backend backend)
-      ;; Ensure Emacs server is running for the Claude Code backend
-      (when (eq backend 'claude-code)
-        (require 'server)
-        (unless (server-running-p)
-          (server-start)
-          (message "[llminate] Started Emacs server for emacsclient access")))
+      ;; Call setup on new backend if present
+      (let ((new-desc (llminate-bridge--get-backend)))
+        (when (plist-get new-desc :setup-fn)
+          (funcall (plist-get new-desc :setup-fn))))
       (when was-running
         (llminate-bridge-start dir))
       (message "[llminate] Switched to %s backend" backend))))
@@ -799,22 +855,32 @@ Full command list: %s"
 
 (defun llminate-bridge-send-prompt-with-context (prompt &optional callback)
   "Send PROMPT to the backend with editor context prepended.
-For the llminate backend, prepends editor state JSON.
-For the Claude Code backend, also includes emacsclient instructions
-so the AI knows how to call Emacs functions via Bash.
+Uses the backend's `:enrich-fn' if provided for additional context
+\(e.g., emacsclient instructions for Claude Code).
 Optional CALLBACK is forwarded to `llminate-bridge-send-prompt'."
   (let* ((ctx (llminate-bridge--collect-editor-context))
          (json-encoding-pretty-print nil)
          (ctx-str (json-encode ctx))
-         (emacsclient-section
-          (when (eq llminate-bridge-backend 'claude-code)
-            (llminate-bridge--emacsclient-instructions)))
-         (enriched (if emacsclient-section
+         (desc (llminate-bridge--get-backend))
+         (enrich-fn (plist-get desc :enrich-fn))
+         (extra-section (when enrich-fn (funcall enrich-fn)))
+         (enriched (if extra-section
                        (format "%s\n\n[Editor Context]\n%s\n\n[User Prompt]\n%s"
-                               emacsclient-section ctx-str prompt)
+                               extra-section ctx-str prompt)
                      (format "[Editor Context]\n%s\n\n[User Prompt]\n%s"
                              ctx-str prompt))))
     (llminate-bridge-send-prompt enriched callback)))
+
+;;;; Self-registration: llminate backend
+
+(llminate-bridge-register-backend
+ '(:name           llminate
+   :label          "llminate (Rust binary)"
+   :prefix         "llm"
+   :start-fn       llminate-bridge--start-llminate
+   :stop-fn        llminate-bridge--stop-llminate
+   :running-p-fn   llminate-bridge--llminate-running-p
+   :send-prompt-fn llminate-bridge--send-prompt-llminate))
 
 (provide 'llminate-bridge)
 

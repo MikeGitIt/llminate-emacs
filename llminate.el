@@ -31,7 +31,13 @@
 ;;; Code:
 
 (require 'llminate-bridge)
+
+;; Backend adapters — each self-registers via llminate-bridge-register-backend
 (require 'llminate-bridge-claude)
+(require 'llminate-bridge-gemini nil t)  ; optional — loaded if available
+(require 'llminate-bridge-codex nil t)   ; optional — loaded if available
+(require 'llminate-bridge-aider nil t)   ; optional — loaded if available
+
 (require 'llminate-chat)
 (require 'llminate-layout)
 (require 'llminate-approval)

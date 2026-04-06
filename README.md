@@ -1,10 +1,10 @@
 # llminate-emacs
 
-Emacs integration for the [llminate](https://github.com/MikeGitIt/llminate) AI coding assistant, with support for Claude Code CLI as an alternative backend.
+Emacs integration for the [llminate](https://github.com/MikeGitIt/llminate) AI coding assistant, with an extensible backend system supporting multiple AI coding agents.
 
 ## Features
 
-- **Dual backend support** -- use either the llminate Rust binary or Claude Code CLI (`claude -p`)
+- **Multi-backend support** -- llminate, Claude Code, Gemini CLI, Codex CLI, and Aider out of the box, with a registration API for adding more
 - **Streaming chat UI** with markdown rendering in a dedicated side panel
 - **IDE-style multi-panel layout** -- treemacs, editor, chat log, activity log, and prompt input
 - **Tool approval interface** with ediff preview for file edits, syntax-highlighted Bash commands, and transient menus
@@ -19,6 +19,9 @@ Emacs integration for the [llminate](https://github.com/MikeGitIt/llminate) AI c
 - At least one backend:
   - **llminate** -- the Rust binary (`cargo install llminate` or build from source)
   - **Claude Code CLI** -- install via `npm install -g @anthropic-ai/claude-code`
+  - **Gemini CLI** -- install via `npm install -g @anthropic-ai/gemini-cli` (or see [gemini-cli](https://github.com/google-gemini/gemini-cli))
+  - **Codex CLI** -- install via `cargo install codex` (or see [codex](https://github.com/openai/codex))
+  - **Aider** -- install via `pip install aider-chat` (or see [aider](https://aider.chat))
 - Optional: [pandoc](https://pandoc.org/) for HTML/Org chat log export
 - Optional: [treemacs](https://github.com/Alexander-Miller/treemacs) for the file tree panel in the IDE layout
 
@@ -52,6 +55,8 @@ Add to your init file:
 (llminate-mode 1)
 ```
 
+**IMPORTANT:** You must `(require 'llminate)`, NOT `(require 'llminate-mode)`. The `llminate.el` entry point loads all backend adapters. Loading `llminate-mode` directly skips the adapters and only the llminate backend will be available. See [Troubleshooting: Only one backend appears](#only-one-backend-appears-in-switch-backend).
+
 ## Configuration
 
 ### Choosing a backend
@@ -62,8 +67,17 @@ The `llminate-bridge-backend` variable controls which AI backend to use. Set it 
 ;; Use the llminate Rust binary (default)
 (setq llminate-bridge-backend 'llminate)
 
-;; Use Claude Code CLI instead
+;; Use Claude Code CLI
 (setq llminate-bridge-backend 'claude-code)
+
+;; Use Gemini CLI
+(setq llminate-bridge-backend 'gemini-cli)
+
+;; Use Codex CLI (OpenAI)
+(setq llminate-bridge-backend 'codex-cli)
+
+;; Use Aider
+(setq llminate-bridge-backend 'aider)
 ```
 
 ### Backend executables
@@ -74,6 +88,25 @@ The `llminate-bridge-backend` variable controls which AI backend to use. Set it 
 
 ;; Path to the Claude Code CLI (default: "claude")
 (setq llminate-bridge-claude-executable "claude")
+
+;; Path to the Gemini CLI (default: "gemini")
+(setq llminate-bridge-gemini-executable "gemini")
+
+;; Path to the Codex CLI (default: "codex")
+(setq llminate-bridge-codex-executable "codex")
+
+;; Path to Aider (default: "aider")
+(setq llminate-bridge-aider-executable "aider")
+```
+
+### Aider-specific settings
+
+```elisp
+;; Allow Aider to auto-commit changes (default: nil)
+(setq llminate-bridge-aider-auto-commit nil)
+
+;; Extra files to include in Aider's context
+(setq llminate-bridge-aider-extra-files '("src/main.rs" "Cargo.toml"))
 ```
 
 ### Model selection
@@ -187,7 +220,7 @@ All keybindings are under the `C-c q` prefix:
 | `C-c q .` | `completion-at-point`            | Trigger completion-at-point              |
 | `C-c q w` | `llminate-emacs-commands-list`   | List allowed Emacs commands              |
 | `C-c q m` | `llminate-chat-set-render-backend` | Switch markdown render backend         |
-| `C-c q b` | `llminate-bridge-switch-backend` | Switch between llminate / Claude Code    |
+| `C-c q b` | `llminate-bridge-switch-backend` | Switch between registered backends       |
 
 ### Tool approval keys
 
@@ -214,25 +247,27 @@ When a ghost text suggestion is visible:
 
 ## Switching backends at runtime
 
-Use `C-c q b` or `M-x llminate-bridge-switch-backend` to switch between the llminate and Claude Code backends without restarting Emacs. If a session is running, it will be stopped and restarted with the new backend.
+Use `C-c q b` or `M-x llminate-bridge-switch-backend` to switch between any registered backend without restarting Emacs. If a session is running, it will be stopped and restarted with the new backend. The completion menu shows all registered backends with their labels.
 
 To persist your choice across sessions, set `llminate-bridge-backend` in your init file.
 
-### Backend differences
+### Backend comparison
 
-| Feature              | llminate                        | Claude Code CLI                  |
-|----------------------|---------------------------------|----------------------------------|
-| Process model        | Single long-lived subprocess    | One process per turn             |
-| Multi-turn           | Continuous stdin                | `--resume SESSION_ID`            |
-| Tool approval        | Full approval UI with ediff     | Not available (pre-configured)   |
-| Emacs command exec   | EmacsEval over stdio pipe       | emacsclient -e via Bash          |
-| Text streaming       | `Message` events with chunks    | `content_block_delta` events     |
-| Modeline indicator   | `llm[idle]`, `llm[streaming]`   | `cc[idle]`, `cc[streaming]`      |
+| Feature              | llminate              | Claude Code           | Gemini CLI            | Codex CLI             | Aider                 |
+|----------------------|-----------------------|-----------------------|-----------------------|-----------------------|-----------------------|
+| Process model        | Long-lived subprocess | One process per turn  | One process per turn  | One process per turn  | One process per turn  |
+| Multi-turn           | Continuous stdin      | `--resume SESSION_ID` | `--resume SESSION_ID` | `--thread-id ID`      | None (independent)    |
+| Protocol             | JSON-lines            | NDJSON (stream-json)  | NDJSON (stream-json)  | NDJSON (exec --json)  | Plain text            |
+| Text streaming       | Yes (chunks)          | Yes (deltas)          | Yes (deltas)          | No (all at once)      | No (all at once)      |
+| Tool events          | ToolUse/ToolResult    | content_block_*       | tool_use/tool_result  | item.started/completed| Regex-detected edits  |
+| Tool approval        | Full approval UI      | Not available         | Not available         | Not available         | Auto-approved (--yes) |
+| Emacs command exec   | EmacsEval via stdio   | emacsclient via Bash  | emacsclient via Bash  | emacsclient via Bash  | emacsclient via Bash  |
+| Modeline prefix      | `llm`                 | `cc`                  | `gm`                  | `cx`                  | `ai`                  |
 
-When using the Claude Code backend:
-- The tool approval module is dormant (tools execute autonomously inside Claude Code)
+When using external CLI backends (Claude Code, Gemini, Codex, Aider):
+- The tool approval module is dormant (tools execute autonomously inside the CLI)
 - Emacs commands work via `emacsclient -e` instead of the stdio pipe -- same whitelist, same security levels
-- The Emacs server is auto-started when you switch to the Claude Code backend
+- The Emacs server is auto-started when backends with a `:setup-fn` are activated (e.g., Claude Code)
 - Tool activity is still logged in the activity buffer with synthetic results
 
 ## Emacs command whitelist
@@ -468,8 +503,11 @@ The modeline indicator shows the active backend and current state:
 |-------------------------------|------------------------------------------------|
 | `llminate.el`                 | Package entry point, loads all modules          |
 | `llminate-mode.el`            | Global minor mode, keybindings, modeline        |
-| `llminate-bridge.el`          | Process bridge with backend dispatch            |
-| `llminate-bridge-claude.el`   | Claude Code CLI protocol adapter                |
+| `llminate-bridge.el`          | Process bridge, backend registry, and dispatch  |
+| `llminate-bridge-claude.el`   | Claude Code CLI adapter (NDJSON stream-json)    |
+| `llminate-bridge-gemini.el`   | Gemini CLI adapter (NDJSON stream-json)         |
+| `llminate-bridge-codex.el`    | Codex CLI adapter (NDJSON exec --json)          |
+| `llminate-bridge-aider.el`    | Aider adapter (plain text, regex-based parsing) |
 | `llminate-chat.el`            | Streaming chat UI with markdown rendering       |
 | `llminate-layout.el`          | IDE multi-panel layout and activity log         |
 | `llminate-approval.el`        | Tool approval UX with ediff and transient       |
@@ -507,6 +545,39 @@ Selection uses tree-sitter when available (Emacs 29.1+), falling back to `beginn
 The lowercase variants (`C-c q e`, `C-c q f`) still require a manually selected region.
 
 ## Troubleshooting
+
+### Only one backend appears in switch-backend
+
+**Cause:** Your init file loads `(require 'llminate-mode)` instead of `(require 'llminate)`. The `llminate-mode.el` module only loads the core bridge (which registers the `llminate` backend). The adapter files for Claude Code, Gemini, Codex, and Aider are loaded by `llminate.el` — if you skip it, those backends never register.
+
+**Fix:**
+
+1. Change your init file to use the correct entry point:
+
+   ```elisp
+   ;; WRONG — only the llminate backend will be available
+   (require 'llminate-mode)
+
+   ;; CORRECT — loads all backend adapters
+   (require 'llminate)
+   ```
+
+2. If you installed via the symlink method, make sure **all** adapter `.el` files are symlinked into your load path:
+
+   ```bash
+   # Re-run the symlink loop to pick up any new files
+   for f in ~/Code/llminate-emacs/*.el; do
+     ln -sf "$f" ~/.emacs.d/lisp/$(basename "$f")
+   done
+   ```
+
+3. Restart Emacs and verify that all backends are registered:
+
+   ```
+   M-: (mapcar #'car llminate-bridge--backend-registry)
+   ```
+
+   Should return `(aider codex-cli gemini-cli claude-code llminate)` (order may vary).
 
 ### Claude Code: "Emacs commands are being denied"
 
@@ -577,6 +648,9 @@ Enable raw process output logging:
 Then inspect the process buffer:
 - `*llminate-process*` for the llminate backend
 - ` *claude-code-process*` for the Claude Code backend (note leading space)
+- ` *gemini-cli-process*` for the Gemini CLI backend (note leading space)
+- ` *codex-cli-process*` for the Codex CLI backend (note leading space)
+- ` *aider-process*` for the Aider backend (note leading space)
 
 Check `*Messages*` for:
 - `[llminate]` or `[claude-code]` prefixed messages from the bridge

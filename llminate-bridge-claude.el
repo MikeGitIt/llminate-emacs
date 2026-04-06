@@ -480,6 +480,30 @@ fire error + ready hooks."
               (llminate-bridge-claude--send-prompt
                (car next) (cdr next)))))))))
 
+;;;; Setup and self-registration
+
+(defun llminate-bridge-claude--setup ()
+  "Setup function for the Claude Code backend.
+Ensures the Emacs server is running for emacsclient access."
+  (require 'server)
+  (unless (server-running-p)
+    (server-start)
+    (message "[llminate] Started Emacs server for emacsclient access")))
+
+;; Declare server-running-p for the setup function
+(declare-function server-running-p "server" (&optional name))
+
+(llminate-bridge-register-backend
+ '(:name           claude-code
+   :label          "Claude Code CLI"
+   :prefix         "cc"
+   :start-fn       llminate-bridge-claude--start
+   :stop-fn        llminate-bridge-claude--stop
+   :running-p-fn   llminate-bridge-claude--running-p
+   :send-prompt-fn llminate-bridge-claude--send-prompt
+   :enrich-fn      llminate-bridge--emacsclient-instructions
+   :setup-fn       llminate-bridge-claude--setup))
+
 (provide 'llminate-bridge-claude)
 
 ;;; llminate-bridge-claude.el ends here

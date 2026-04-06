@@ -706,6 +706,61 @@ timestamp + separator, and cleans up markers."
     (llminate-chat--begin-assistant-turn)
     (setq llminate-chat--assistant-turn-started t)))
 
+(defun llminate-chat--tool-use-detail (name input)
+  "Build a clean display string for a tool-use event.
+NAME is the tool or command name.  INPUT is a plist of parameters.
+Returns a compact, readable string."
+  (cond
+   ;; Bash-style command: show just the command, not the JSON wrapper
+   ((and (stringp name)
+         (or (string-prefix-p "bash " name)
+             (string-prefix-p "Bash" name)
+             ;; Codex sends the full command as the name
+             (string-match-p "^[a-z/].*" name)))
+    ;; If input has a :command field identical to name, don't repeat it
+    (let ((cmd (and (listp input) (plist-get input :command))))
+      (if (and cmd (string= cmd name))
+          (format "Bash: %s" (llminate-chat--shorten-command name))
+        (format "%s" (llminate-chat--shorten-command name)))))
+   ;; Named tool (Read, Grep, Edit, etc.) with input parameters
+   ((and (stringp name) input)
+    (let* ((file (or (and (listp input) (plist-get input :file_path))
+                     (and (listp input) (plist-get input :path))
+                     (and (listp input) (plist-get input :pattern))))
+           (short (if (and file (stringp file))
+                      (abbreviate-file-name file)
+                    (let ((json-encoding-pretty-print nil))
+                      (json-encode input)))))
+      (format "%s %s" name
+              (if (> (length short) 80)
+                  (concat (substring short 0 80) "...")
+                short))))
+   ;; Fallback
+   (t (or name "unknown tool"))))
+
+(defun llminate-chat--shorten-command (cmd)
+  "Shorten a shell command CMD for display.
+Strips `bash -lc' wrapper and truncates to 100 chars."
+  (let ((cleaned cmd))
+    ;; Strip common shell wrappers
+    (when (string-match "^bash\\s+-[a-z]*c\\s+\\(.+\\)" cleaned)
+      (setq cleaned (match-string 1 cleaned)))
+    ;; Strip outer quotes
+    (when (and (> (length cleaned) 1)
+               (memq (aref cleaned 0) '(?\" ?'))
+               (eq (aref cleaned 0) (aref cleaned (1- (length cleaned)))))
+      (setq cleaned (substring cleaned 1 -1)))
+    (if (> (length cleaned) 100)
+        (concat (substring cleaned 0 100) "...")
+      cleaned)))
+
+(defun llminate-chat--first-meaningful-line (text)
+  "Return the first non-blank line from TEXT."
+  (if (and text (stringp text))
+      (let ((lines (split-string text "\n" t "\\s-*")))
+        (or (car lines) ""))
+    ""))
+
 (defun llminate-chat--response-handler (type data)
   "Handle bridge response events of TYPE with DATA."
   (cond
@@ -716,31 +771,29 @@ timestamp + separator, and cleans up markers."
       (llminate-chat--stream-chunk data)))
 
    ((eq type 'tool-use)
-    ;; Display tool invocation
+    ;; Display tool invocation — clean, compact format
     (llminate-chat--ensure-assistant-turn)
-    (let ((name (plist-get data :name))
-          (input (plist-get data :input)))
+    (let* ((name (plist-get data :name))
+           (input (plist-get data :input))
+           ;; Extract the most useful display string from input
+           (detail (llminate-chat--tool-use-detail name input)))
       (llminate-chat--append-to-log
        (propertize "[Tool] " 'face 'llminate-chat-tool-face)
-       (format "%s %s"
-               name
-               (if input
-                   (let ((json-encoding-pretty-print nil))
-                     (json-encode input))
-                 ""))
+       detail
        'llminate-chat-tool-face)))
 
    ((eq type 'tool-result)
-    ;; Display tool result (truncated)
-    (let ((output (if (stringp data)
-                      data
-                    (let ((json-encoding-pretty-print nil))
-                      (json-encode data)))))
-      (llminate-chat--append-to-log
-       "  => "
-       (if (> (length output) 200)
-           (concat (substring output 0 200) "...")
-         output))))
+    ;; Display tool result — single line, truncated
+    (let* ((output (if (stringp data)
+                       data
+                     (let ((json-encoding-pretty-print nil))
+                       (json-encode data))))
+           ;; Take first non-blank line only
+           (first-line (llminate-chat--first-meaningful-line output))
+           (truncated (if (> (length first-line) 120)
+                         (concat (substring first-line 0 120) "...")
+                       first-line)))
+      (llminate-chat--append-to-log "  => " truncated)))
 
    ((eq type 'tool-approval)
     ;; Show that approval is being requested

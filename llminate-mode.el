@@ -27,9 +27,6 @@
 (declare-function flymake-diagnostic-type "flymake" (diagnostic))
 (declare-function flymake-diagnostic-text "flymake" (diagnostic))
 
-;; Declare server function used when starting with claude-code backend.
-(declare-function server-running-p "server" (&optional name))
-
 ;; Declare treesit functions used in smart selection.
 ;; Guarded at runtime by (treesit-available-p) / (treesit-parser-list).
 (declare-function treesit-available-p "treesit" ())
@@ -55,11 +52,12 @@
   "Current modeline indicator string.")
 
 (defun llminate-mode--backend-prefix ()
-  "Return the modeline prefix for the active backend.
-\"llm\" for the llminate backend, \"cc\" for Claude Code."
-  (if (eq (bound-and-true-p llminate-bridge-backend) 'claude-code)
-      "cc"
-    "llm"))
+  "Return the modeline prefix for the active backend from the registry."
+  (let ((entry (assq (bound-and-true-p llminate-bridge-backend)
+                     (bound-and-true-p llminate-bridge--backend-registry))))
+    (if entry
+        (plist-get (cdr entry) :prefix)
+      "llm")))
 
 (defun llminate-mode--update-modeline ()
   "Update the modeline string based on bridge state and active backend."
@@ -351,11 +349,11 @@ Keybindings (C-c q prefix):
   C-c q .  Trigger completion-at-point
   C-c q w  List allowed Emacs commands
   C-c q m  Switch markdown render backend
-  C-c q b  Switch AI backend (llminate / Claude Code)
+  C-c q b  Switch AI backend
 
-Modeline indicator shows backend and bridge state:
-  llm[idle]  llm[streaming]  llm[tool:Bash]  (llminate backend)
-  cc[idle]   cc[streaming]   cc[tool:Bash]   (Claude Code backend)"
+Modeline indicator shows backend prefix and bridge state:
+  llm[idle]  cc[streaming]  gm[tool:Bash]  cx[idle]  ai[streaming]
+The prefix is determined by the active backend's :prefix key."
   :global t
   :lighter llminate-mode--modeline-string
   :keymap llminate-mode-map
@@ -367,15 +365,12 @@ Modeline indicator shows backend and bridge state:
         ;; Add CAPF in prog-mode buffers if llminate-completion is loaded
         (when (fboundp 'llminate-completion--setup)
           (add-hook 'prog-mode-hook #'llminate-completion--setup))
-        ;; Ensure Emacs server is running when using Claude Code backend.
-        ;; Claude Code calls Emacs commands via emacsclient -e, which
-        ;; requires the server to be active.
-        (when (and (eq (bound-and-true-p llminate-bridge-backend) 'claude-code)
-                   (not (bound-and-true-p server-process)))
-          (require 'server)
-          (unless (server-running-p)
-            (server-start)
-            (message "[llminate] Started Emacs server for emacsclient access")))
+        ;; Call setup-fn for current backend if available
+        (let ((entry (assq (bound-and-true-p llminate-bridge-backend)
+                           (bound-and-true-p llminate-bridge--backend-registry))))
+          (when entry
+            (let ((setup-fn (plist-get (cdr entry) :setup-fn)))
+              (when setup-fn (funcall setup-fn)))))
         (message "[llminate] Mode enabled — C-c q c for command palette"))
     (llminate-mode--unregister-modeline-hooks)
     (when (fboundp 'llminate-completion--setup)

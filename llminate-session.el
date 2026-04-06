@@ -122,8 +122,9 @@ No-op if there is no active session."
 
 ;;;###autoload
 (defun llminate-session-resume (session-id)
-  "Resume a llminate session identified by SESSION-ID.
-Restarts the llminate subprocess with `--resume SESSION-ID'."
+  "Resume a session identified by SESSION-ID.
+Delegates to the current backend's `:resume-fn' if one is registered,
+otherwise falls back to passing `--resume SESSION-ID' to `llminate-bridge-start'."
   (interactive
    (list (llminate-session--pick-session "Resume session: ")))
   (unless session-id
@@ -133,16 +134,21 @@ Restarts the llminate subprocess with `--resume SESSION-ID'."
          (entry (cl-find-if
                  (lambda (s) (string= (plist-get s :session_id) session-id))
                  sessions))
-         (project-dir (when entry (plist-get entry :project_dir))))
+         (project-dir (when entry (plist-get entry :project_dir)))
+         (desc (llminate-bridge--get-backend))
+         (resume-fn (plist-get desc :resume-fn)))
     ;; Stop current session if running
     (when (llminate-bridge-running-p)
       (llminate-bridge-stop)
       (sit-for 0.3))
-    ;; Add --resume to extra args and start
-    (let ((llminate-bridge-extra-args
-           (append llminate-bridge-extra-args
-                   (list "--resume" session-id))))
-      (llminate-bridge-start (or project-dir default-directory)))
+    (if resume-fn
+        ;; Backend-specific resume
+        (funcall resume-fn session-id (or project-dir default-directory))
+      ;; Default: pass --resume to llminate-bridge-start
+      (let ((llminate-bridge-extra-args
+             (append llminate-bridge-extra-args
+                     (list "--resume" session-id))))
+        (llminate-bridge-start (or project-dir default-directory))))
     (message "[llminate-session] Resuming session %s" session-id)))
 
 (defun llminate-session--pick-session (prompt)
@@ -256,7 +262,7 @@ RET to resume, d to delete, q to quit."
 ;;;; Chat log export — markdown, HTML, org
 ;;
 ;; After each assistant turn, export the full conversation in 3 formats
-;; alongside the Rust-side JSON in .claude/conversations/.
+;; into the project's conversations directory (default: .llminate/conversations/).
 
 (defcustom llminate-session-chatlog-auto-save t
   "When non-nil, auto-export chat logs after each assistant turn."
@@ -268,10 +274,15 @@ RET to resume, d to delete, q to quit."
   :type 'string
   :group 'llminate-session)
 
+(defcustom llminate-session-conversations-dir ".llminate/conversations/"
+  "Relative directory (under the project root) for exported chat logs."
+  :type 'string
+  :group 'llminate-session)
+
 (defun llminate-session--conversations-dir ()
-  "Return the .claude/conversations/ directory for the current project.
+  "Return the conversations directory for the current project.
 Creates it if necessary."
-  (let ((dir (expand-file-name ".claude/conversations/"
+  (let ((dir (expand-file-name llminate-session-conversations-dir
                                 (or llminate-bridge--project-dir
                                     default-directory))))
     (make-directory dir t)
